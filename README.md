@@ -66,7 +66,8 @@ API_SECRET=your_upbit_secret_key
 
 다음 명령어를 통해 봇을 실행합니다:
 
-```python .\mvp.py
+```bash
+python .\mvp.py
 ```
 
 ---
