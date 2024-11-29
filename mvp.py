@@ -4,7 +4,6 @@ import pandas as pd
 import pyupbit
 from dotenv import load_dotenv
 
-
 # API 키 로드
 def load_api_keys():
     load_dotenv()
@@ -12,6 +11,39 @@ def load_api_keys():
     secret = os.getenv("API_SECRET")
     return access, secret
 
+# 거래량 증가율 계산 함수
+def calculate_volume_ratio(data):
+    avg_volume = data['volume'].rolling(window=20).mean().iloc[-2]
+    current_volume = data['volume'].iloc[-1]
+    return current_volume / avg_volume if avg_volume > 0 else 0
+
+# 거래량 기반 매수/매도 판단 함수
+def analyze_trading_opportunity(ticker, interval="minute1"):
+    try:
+        for attempt in range(3):  # 최대 3회 재시도
+            df = pyupbit.get_ohlcv(ticker, count=200, interval=interval)
+            if df is not None and not df.empty:
+                break
+            time.sleep(1)  # 재시도 전 대기
+        else:
+            print(f"{ticker}: 데이터를 가져오지 못했습니다.")
+            return None
+
+        # 거래량 증가율 계산
+        volume_ratio = calculate_volume_ratio(df)
+
+        # RSI 계산
+        rsi = calculate_rsi(df['close'], periods=14).iloc[-1] if len(df) >= 14 else None
+
+        return {
+            "volume_ratio": volume_ratio,
+            "rsi": rsi,
+            "current_price": df['close'].iloc[-1]
+        }
+
+    except Exception as e:
+        print(f"{ticker} 데이터 분석 오류: {str(e)}")
+        return None
 
 # RSI 계산 함수
 def calculate_rsi(data, periods=14):
@@ -23,99 +55,12 @@ def calculate_rsi(data, periods=14):
     rs = gain / loss.replace(0, float('inf'))
     return 100 - (100 / (1 + rs))
 
-
-# 수익성 점수 계산 함수
-def calculate_profitability_score(ticker, interval="minute5"):
-    try:
-        for attempt in range(3):  # 3회 재시도
-            df = pyupbit.get_ohlcv(ticker, count=200, interval=interval)
-            if df is not None and not df.empty:
-                break
-            time.sleep(1)  # 잠시 대기 후 재시도
-        else:
-            print(f"{ticker}: 데이터를 가져오지 못했습니다.")
-            return 0, []
-
-        # NaN 값 점검
-        if df.isna().any().any():
-            print(f"{ticker}: 데이터에 NaN 값이 있습니다.")
-            return 0, []
-
-        score = 0
-        score_logs = []
-
-        # 1. RSI 점수
-        rsi = calculate_rsi(df['close'], periods=14).iloc[-1]
-        if pd.isna(rsi):
-            print(f"{ticker}: RSI 계산 실패")
-            return 0, []
-        if rsi < 30:
-            score += 25
-            score_logs.append("RSI: +25")
-        elif rsi > 70:
-            score -= 15
-            score_logs.append("RSI: -15")
-        else:
-            score += 10
-            score_logs.append("RSI: +10")
-
-        # 2. MACD 점수
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=9, adjust=False).mean()
-        macd_hist = macd - signal
-
-        if macd_hist.iloc[-1] > 0 and macd_hist.iloc[-2] <= 0:
-            score += 20
-            score_logs.append("MACD: +20")
-        elif macd_hist.iloc[-1] < 0 and macd_hist.iloc[-2] >= 0:
-            score -= 15
-            score_logs.append("MACD: -15")
-        else:
-            score_logs.append("MACD: 0")
-
-        # 3. 볼린저 밴드 점수
-        ma20 = df['close'].rolling(window=20).mean()
-        std = df['close'].rolling(window=20).std()
-        upper = ma20 + 2 * std
-        lower = ma20 - 2 * std
-        current_price = df['close'].iloc[-1]
-
-        bb_position = (current_price - lower.iloc[-1]) / (upper.iloc[-1] - lower.iloc[-1])
-        if bb_position < 0.2:
-            score += 15
-            score_logs.append("BB: +15")
-        elif bb_position > 0.8:
-            score -= 10
-            score_logs.append("BB: -10")
-        else:
-            score_logs.append("BB: 0")
-
-        # 4. 이동평균선 점수
-        ma5 = df['close'].rolling(window=5).mean()
-        if ma5.iloc[-1] > ma20.iloc[-1]:
-            score += 15
-            score_logs.append("이평선: +15")
-        else:
-            score -= 10
-            score_logs.append("이평선: -10")
-
-        final_score = max(0, min(100, score))
-        return final_score, score_logs
-
-    except Exception as e:
-        print(f"점수 계산 오류: {str(e)}")
-        return 0, []
-
-
 # 매수 함수
 def handle_buy(upbit, ticker):
     my_krw = upbit.get_balance("KRW")
     if my_krw > 5000:
         upbit.buy_market_order(ticker, my_krw * 0.9995)
         print(f"{ticker} 매수 완료")
-
 
 # 매도 함수
 def handle_sell(upbit, ticker):
@@ -124,8 +69,35 @@ def handle_sell(upbit, ticker):
         upbit.sell_market_order(ticker, my_coin)
         print(f"{ticker} 매도 완료")
 
+# 매도/매수 최소 조건
+MIN_PROFIT_MARGIN = 0.06  # 수수료 보전 후 최소 이익률 (0.06 = 6% 설정)
 
-# 자동 매매 실행 함수
+# 예상 수익률 계산
+def calculate_expected_profit(buy_price, current_price):
+    return (current_price - buy_price) / buy_price * 100
+
+# 매도 판단 함수
+def should_sell(coin_opportunity, best_opportunity, buy_price):
+    # 1. RSI 과매수 조건
+    if coin_opportunity['rsi'] and coin_opportunity['rsi'] > 70:
+        print(f"매도 결정: RSI 과매수 (RSI={coin_opportunity['rsi']:.2f})")
+        return True
+
+    # 2. 거래량 급증 비교
+    if best_opportunity['volume_ratio'] > coin_opportunity['volume_ratio'] * 1.5:
+        print(f"매도 결정: 거래량 급증 기회 비교")
+        return True
+
+    # 3. 수익률 판단
+    current_price = coin_opportunity['current_price']
+    profit_margin = calculate_expected_profit(buy_price, current_price)
+    if profit_margin >= MIN_PROFIT_MARGIN:
+        print(f"매도 결정: 예상 수익률 만족 (이익률={profit_margin:.2f}%)")
+        return True
+
+    return False
+
+# 수정된 run_trading_bot
 def run_trading_bot():
     access, secret = load_api_keys()
     upbit = pyupbit.Upbit(access, secret)
@@ -139,46 +111,61 @@ def run_trading_bot():
                 time.sleep(10)
                 continue
 
-            # 보유 코인 점수 확인
-            balances = upbit.get_balances()
-            owned_coins = ["KRW-" + balance['currency'] for balance in balances if float(balance['balance']) > 0 and balance['currency'] != "KRW"]
-
-            best_score = 0
             best_ticker = None
-            best_logs = []
+            best_opportunity = None
 
-            # 전체 코인 점수 계산
+            # 보유 코인 확인 및 매수 가격 기록
+            balances = upbit.get_balances()
+            owned_coins = {
+                "KRW-" + balance['currency']: float(balance['avg_buy_price'])
+                for balance in balances if float(balance['balance']) > 0 and balance['currency'] != "KRW"
+            }
+
+            # 전체 코인 분석
             for ticker in tickers:
-                score, logs = calculate_profitability_score(ticker)
-                print(f"{ticker} 점수: {score} | 로그: {logs}")
+                opportunity = analyze_trading_opportunity(ticker, interval="minute1")
+                if not opportunity:
+                    continue
 
-                if score > best_score:
-                    best_score = score
-                    best_ticker = ticker
-                    best_logs = logs
+                print(f"{ticker} 분석 결과: {opportunity}")
 
-            print(f"\n최고 점수 코인: {best_ticker} | 점수: {best_score} | 로그: {best_logs}")
+                # 매수 기회 판단
+                if opportunity['volume_ratio'] > 3 and opportunity['rsi'] and opportunity['rsi'] < 20:
+                    if not best_opportunity or opportunity['volume_ratio'] > best_opportunity['volume_ratio']:
+                        best_ticker = ticker
+                        best_opportunity = opportunity
 
-            # 보유 코인 점수 확인 및 매도 판단
-            for coin in owned_coins:
-                coin_score, coin_logs = calculate_profitability_score(coin)
-                print(f"보유 코인 {coin} 점수: {coin_score} | 로그: {coin_logs}")
+            # 매도/매수 실행
+            if best_ticker and best_opportunity:
+                print(f"최고 매수 후보: {best_ticker} | 분석: {best_opportunity}")
 
-                # 매도 조건: 점수가 20 이하이거나 최고 점수 코인이 10점 더 높은 경우
-                if coin_score <= 20 or (best_score - coin_score >= 10):
-                    print(f"{coin} 매도 결정")
-                    handle_sell(upbit, coin)
+                # 보유 코인 매도 판단
+                for coin, buy_price in owned_coins.items():
+                    coin_opportunity = analyze_trading_opportunity(coin, interval="minute1")
+                    if not coin_opportunity:
+                        continue
 
-            # 최고 점수 코인 매수
-            if best_ticker and best_score >= 45:
+                    print(f"보유 코인 {coin} 분석 결과: {coin_opportunity}")
+
+                    if should_sell(coin_opportunity, best_opportunity, buy_price):
+                        handle_sell(upbit, coin)
+
+                # 매수 실행
                 handle_buy(upbit, best_ticker)
 
-            time.sleep(300)  # 5분 대기
+            # 보유 중인 코인 정보 출력
+            if owned_coins:
+                print("현재 보유 중인 코인:")
+                for coin, buy_price in owned_coins.items():
+                    print(f"{coin}: 매수 가격 {buy_price:.2f} 원")
+            else:
+                print("보유 중인 코인이 없습니다.")
+
+            time.sleep(60)  # 1분 대기
 
         except Exception as e:
             print(f"오류 발생: {str(e)}")
             time.sleep(10)
-
 
 if __name__ == "__main__":
     run_trading_bot()
