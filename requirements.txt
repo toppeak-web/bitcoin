@@ -1,4 +1,4 @@
-python-dotenv
+pandas
 pyupbit
-
-
+python-dotenv
+python-telegram-bot
